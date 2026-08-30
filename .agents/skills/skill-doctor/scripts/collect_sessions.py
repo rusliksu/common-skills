@@ -216,14 +216,18 @@ def extract_text(content) -> str:
     return "\n".join(parts)
 
 
+def read_text_prefix(path: Path, max_bytes: int = MAX_FILE_BYTES) -> str:
+    """Read and decode at most max_bytes without loading the whole file."""
+    with path.open("rb") as stream:
+        return stream.read(max_bytes).decode("utf-8", errors="replace")
+
+
 def parse_claude_session(path: Path, skill_names, include_subagents: bool):
     """Normalize one Claude Code JSONL session to the shared transcript shape."""
     try:
-        raw = path.read_text(errors="replace")
+        raw = read_text_prefix(path)
     except OSError:
         return None
-    if len(raw) > MAX_FILE_BYTES:
-        raw = raw[:MAX_FILE_BYTES]
 
     meta = {}
     stats = {
@@ -373,11 +377,9 @@ def looks_injected(text: str) -> bool:
 def parse_codex_session(path: Path, skill_names, include_subagents: bool):
     """Returns (meta, stats, entries) or None if the session should be skipped."""
     try:
-        raw = path.read_text(errors="replace")
+        raw = read_text_prefix(path)
     except OSError:
         return None
-    if len(raw) > MAX_FILE_BYTES:
-        raw = raw[:MAX_FILE_BYTES]
 
     meta = {}
     stats = {"user_turns": 0, "assistant_turns": 0, "tool_calls": 0, "repeated_tool_calls": 0, "error_outputs": 0}

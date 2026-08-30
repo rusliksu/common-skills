@@ -7,12 +7,16 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 from collect_sessions import (
+    MAX_FILE_BYTES,
     detect_skills_from_entries,
     discover_skills,
     find_claude_session_files,
     parse_claude_session,
+    parse_codex_session,
+    read_text_prefix,
     session_matches_repos,
 )
 
@@ -190,6 +194,42 @@ class ClaudeSessionTests(unittest.TestCase):
             parsed = parse_claude_session(path, set(), True)
             self.assertEqual(parsed[0]["id"], "session-1-child-1")
             self.assertEqual(parsed[0]["thread_source"], "subagent")
+
+
+class BoundedSessionReadTests(unittest.TestCase):
+    def test_reader_caps_the_binary_read_before_decoding(self):
+        path = mock.MagicMock()
+        stream = path.open.return_value.__enter__.return_value
+        stream.read.return_value = "привет".encode()
+
+        self.assertEqual(read_text_prefix(path), "привет")
+
+        path.open.assert_called_once_with("rb")
+        stream.read.assert_called_once_with(MAX_FILE_BYTES)
+
+    def test_claude_and_codex_parsers_use_the_bounded_reader(self):
+        path = Path("session.jsonl")
+        claude_record = json.dumps({
+            "type": "user",
+            "sessionId": "claude-session",
+            "cwd": "/tmp/repo",
+            "timestamp": "2026-08-30T10:00:00Z",
+            "message": {"role": "user", "content": "hello"},
+        })
+        codex_record = json.dumps({
+            "type": "session_meta",
+            "payload": {"id": "codex-session", "cwd": "/tmp/repo"},
+        })
+
+        with mock.patch("collect_sessions.read_text_prefix", return_value=claude_record) as reader:
+            parsed_claude = parse_claude_session(path, set(), False)
+            reader.assert_called_once_with(path)
+        with mock.patch("collect_sessions.read_text_prefix", return_value=codex_record) as reader:
+            parsed_codex = parse_codex_session(path, set(), False)
+            reader.assert_called_once_with(path)
+
+        self.assertEqual(parsed_claude[0]["id"], "claude-session")
+        self.assertEqual(parsed_codex[0]["id"], "codex-session")
 
 
 if __name__ == "__main__":
