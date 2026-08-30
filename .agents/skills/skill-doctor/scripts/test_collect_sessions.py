@@ -7,23 +7,34 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest import mock
 
 from collect_sessions import (
-    MAX_FILE_BYTES,
     detect_skills_from_entries,
     discover_skills,
     find_claude_session_files,
     parse_claude_session,
     parse_codex_session,
-    read_text_prefix,
     session_matches_repos,
 )
+
+
+PREVIOUS_FILE_LIMIT = 8 * 1024 * 1024
 
 
 def write_jsonl(path, records):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(json.dumps(record) for record in records) + "\n")
+
+
+def write_jsonl_past_previous_limit(path, first_record, last_records):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    filler = json.dumps({"type": "ignored", "padding": "x" * 1024}) + "\n"
+    with path.open("w", encoding="utf-8") as stream:
+        stream.write(json.dumps(first_record) + "\n")
+        while stream.tell() <= PREVIOUS_FILE_LIMIT:
+            stream.write(filler)
+        for record in last_records:
+            stream.write(json.dumps(record) + "\n")
 
 
 class ClaudeSessionTests(unittest.TestCase):
@@ -196,40 +207,105 @@ class ClaudeSessionTests(unittest.TestCase):
             self.assertEqual(parsed[0]["thread_source"], "subagent")
 
 
-class BoundedSessionReadTests(unittest.TestCase):
-    def test_reader_caps_the_binary_read_before_decoding(self):
-        path = mock.MagicMock()
-        stream = path.open.return_value.__enter__.return_value
-        stream.read.return_value = "привет".encode()
+class StreamingSessionReadTests(unittest.TestCase):
+    def test_claude_and_codex_parse_records_after_previous_file_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            claude_path = root / "claude.jsonl"
+            codex_path = root / "codex.jsonl"
+            write_jsonl_past_previous_limit(
+                claude_path,
+                {
+                    "type": "user",
+                    "sessionId": "claude-session",
+                    "cwd": "/tmp/repo",
+                    "timestamp": "2026-08-30T10:00:00Z",
+                    "message": {"role": "user", "content": "hello"},
+                },
+                [{
+                    "type": "assistant",
+                    "sessionId": "claude-session",
+                    "cwd": "/tmp/repo",
+                    "timestamp": "2026-08-30T10:01:00Z",
+                    "message": {
+                        "id": "late-message",
+                        "role": "assistant",
+                        "content": [
+                            {"type": "text", "text": "late claude message"},
+                            {
+                                "type": "tool_use",
+                                "name": "Read",
+                                "input": {
+                                    "file_path": "/tmp/.agents/skills/late-skill/SKILL.md"
+                                },
+                            },
+                        ],
+                    },
+                }],
+            )
+            write_jsonl_past_previous_limit(
+                codex_path,
+                {
+                    "type": "session_meta",
+                    "payload": {"id": "codex-session", "cwd": "/tmp/repo"},
+                },
+                [{
+                    "type": "response_item",
+                    "timestamp": "2026-08-30T10:00:30Z",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "read_file",
+                        "arguments": {
+                            "path": "/tmp/.codex/skills/late-skill/SKILL.md"
+                        },
+                    },
+                }, {
+                    "type": "response_item",
+                    "timestamp": "2026-08-30T10:01:00Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "late codex message"}],
+                    },
+                }],
+            )
 
-        self.assertEqual(read_text_prefix(path), "привет")
+            parsed_claude = parse_claude_session(claude_path, {"late-skill"}, False)
+            parsed_codex = parse_codex_session(codex_path, {"late-skill"}, False)
 
-        path.open.assert_called_once_with("rb")
-        stream.read.assert_called_once_with(MAX_FILE_BYTES)
+            self.assertEqual(parsed_claude[1]["assistant_turns"], 1)
+            self.assertEqual(parsed_claude[1]["tool_calls"], 1)
+            self.assertEqual(parsed_claude[3], ["late-skill"])
+            self.assertIn(("assistant", "late claude message"), parsed_claude[2])
+            self.assertEqual(parsed_codex[1]["tool_calls"], 1)
+            self.assertEqual(parsed_codex[3], ["late-skill"])
+            self.assertIn(("assistant", "late codex message"), parsed_codex[2])
 
-    def test_claude_and_codex_parsers_use_the_bounded_reader(self):
-        path = Path("session.jsonl")
-        claude_record = json.dumps({
-            "type": "user",
-            "sessionId": "claude-session",
-            "cwd": "/tmp/repo",
-            "timestamp": "2026-08-30T10:00:00Z",
-            "message": {"role": "user", "content": "hello"},
-        })
-        codex_record = json.dumps({
-            "type": "session_meta",
-            "payload": {"id": "codex-session", "cwd": "/tmp/repo"},
-        })
+    def test_codex_keeps_only_transcript_head_and_tail_while_parsing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "codex.jsonl"
+            records = [{
+                "type": "session_meta",
+                "payload": {"id": "codex-session", "cwd": "/tmp/repo"},
+            }]
+            records.extend({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": f"message-{index}"}],
+                },
+            } for index in range(201))
+            write_jsonl(path, records)
 
-        with mock.patch("collect_sessions.read_text_prefix", return_value=claude_record) as reader:
-            parsed_claude = parse_claude_session(path, set(), False)
-            reader.assert_called_once_with(path)
-        with mock.patch("collect_sessions.read_text_prefix", return_value=codex_record) as reader:
-            parsed_codex = parse_codex_session(path, set(), False)
-            reader.assert_called_once_with(path)
+            entries = parse_codex_session(path, set(), False)[2]
 
-        self.assertEqual(parsed_claude[0]["id"], "claude-session")
-        self.assertEqual(parsed_codex[0]["id"], "codex-session")
+            self.assertEqual(len(entries), 141)
+            self.assertEqual(entries[0], ("assistant", "message-0"))
+            self.assertEqual(entries[99], ("assistant", "message-99"))
+            self.assertEqual(entries[100], ("note", "[... 61 entries omitted ...]"))
+            self.assertEqual(entries[101], ("assistant", "message-161"))
+            self.assertEqual(entries[-1], ("assistant", "message-200"))
 
 
 if __name__ == "__main__":
